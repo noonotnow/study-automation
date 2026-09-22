@@ -1,0 +1,120 @@
+name: Generate PASS Anki cards
+on:
+  workflow_dispatch:
+    inputs:
+      deck_path:
+        description: "Repo path to a .ppt/.pptx (blank with deck_url)"
+        required: false
+        type: string
+      deck_url:
+        description: "Direct HTTPS download URL (blank with deck_path)"
+        required: false
+        type: string
+      deck_filename:
+        description: "URL download filename, including .ppt or .pptx"
+        required: false
+        default: "input.pptx"
+        type: string
+      model:
+        description: "Multimodal OpenAI model"
+        required: true
+        default: "gpt-4.1-mini"
+        type: string
+      batch_size:
+        description: "Slides per model request"
+        required: true
+        default: "3"
+        type: string
+      text_only:
+        description: "Skip images and image occlusion"
+        required: true
+        default: false
+        type: boolean
+      skip_review:
+        description: "Skip final atomicity review"
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: pass-anki-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs
+        shell: bash
+        env:
+          DECK_PATH: ${{ inputs.deck_path }}
+          DECK_URL: ${{ inputs.deck_url }}
+        run: |
+          set -euo pipefail
+          [[ -n "$DECK_PATH" || -n "$DECK_URL" ]] || { echo "Provide deck_path or deck_url" >&2; exit 1; }
+          [[ -z "$DECK_PATH" || -z "$DECK_URL" ]] || { echo "Provide only one deck source" >&2; exit 1; }
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-impress poppler-utils tesseract-ocr
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/pass-anki/requirements.txt
+      - run: pip install -r tools/pass-anki/requirements.txt
+      - name: Resolve PowerPoint input
+        id: deck
+        shell: bash
+        env:
+          DECK_PATH: ${{ inputs.deck_path }}
+          DECK_URL: ${{ inputs.deck_url }}
+          DECK_FILENAME: ${{ inputs.deck_filename }}
+        run: |
+          set -euo pipefail
+          mkdir -p .run/input
+          if [[ -n "$DECK_URL" ]]; then
+            case "$DECK_FILENAME" in *.ppt|*.pptx) ;; *) echo "deck_filename must end in .ppt or .pptx" >&2; exit 1;; esac
+            curl --fail --location --retry 3 --retry-all-errors "$DECK_URL" -o ".run/input/$DECK_FILENAME"
+            DECK=".run/input/$DECK_FILENAME"
+          else
+            DECK="$DECK_PATH"
+            [[ -f "$DECK" ]] || { echo "Deck not found: $DECK" >&2; exit 1; }
+            case "$DECK" in *.ppt|*.pptx) ;; *) echo "deck_path must end in .ppt or .pptx" >&2; exit 1;; esac
+          fi
+          echo "path=$DECK" >> "$GITHUB_OUTPUT"
+      - name: Generate cards
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${OPENAI_API_KEY:-}" ]] || { echo "Missing OPENAI_API_KEY repository secret" >&2; exit 1; }
+          args=("${{ steps.deck.outputs.path }}" --output .run/output --model "${{ inputs.model }}" --batch-size "${{ inputs.batch_size }}")
+          [[ "${{ inputs.text_only }}" != "true" ]] || args+=(--text-only)
+          [[ "${{ inputs.skip_review }}" != "true" ]] || args+=(--skip-review)
+          python tools/pass-anki/pass_anki_generator.py "${args[@]}"
+      - name: Package result
+        if: always()
+        shell: bash
+        run: |
+          if [[ -d .run/output ]]; then
+            cd .run/output
+            zip -qr ../pass-anki-output.zip cards.tsv cards.txt media review_rejects.txt extracted_slides.txt 2>/dev/null || true
+          fi
+      - name: Upload Anki package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pass-anki-${{ github.run_number }}
+          path: |
+            .run/pass-anki-output.zip
+            .run/output/cards.tsv
+            .run/output/cards.txt
+            .run/output/media/
+            .run/output/review_rejects.txt
+            .run/output/extracted_slides.txt
+          if-no-files-found: warn
+          retention-days: 14
