@@ -1,6 +1,4 @@
 .run/
 anki_output/
-inputs/*.ppt
-inputs/*.pptx
 __pycache__/
 *.pyc
